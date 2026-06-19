@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=tintty
+GenericName=Terminal
+Comment=Schlanker Wayland-Terminal-Emulator
+Exec=tintty
+Icon=utilities-terminal
+Terminal=false
+Categories=System;TerminalEmulator;
+Keywords=terminal;shell;tty;konsole;
+StartupNotify=false
+StartupWMClass=tintty
