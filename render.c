@@ -507,8 +507,14 @@ drawglyph(pixman_image_t *buf, int px, int py, Rune u, uint16_t mode,
 	}
 }
 
+/* Zwei-Pass-Rendering: fg_pass==0 zeichnet nur den Hintergrund, fg_pass==1 nur
+ * Glyph + Dekorationen. Grund: überbreite Glyphen (Nerd-Font-Icons, Emoji) ragen
+ * über ihre Zelle hinaus. Würde wie früher pro Zelle erst bg, dann glyph gezeichnet,
+ * löschte der Hintergrund der nächsten Zelle den Überstand wieder weg ("rechts
+ * abgeschnitten"). Indem rdraw() erst ALLE Hintergründe und dann ALLE Glyphen malt,
+ * bleibt der Überstand erhalten und das Icon ist vollständig sichtbar. */
 static void
-drawcell(pixman_image_t *buf, int px, int py, const Glyph *gp)
+drawcell(pixman_image_t *buf, int px, int py, const Glyph *gp, int fg_pass)
 {
 	uint32_t fg = gp->fg, bg = gp->bg, t;
 	uint16_t mode = gp->mode;
@@ -520,14 +526,17 @@ drawcell(pixman_image_t *buf, int px, int py, const Glyph *gp)
 
 	if (mode & ATTR_REVERSE) { t = fg; fg = bg; bg = t; }
 
-	loadcolor(bg, 1, &cbg);
+	if (!fg_pass) {
+		loadcolor(bg, 1, &cbg);
+		fillrect(buf, px, py, cellw * w, cellh, &cbg);
+		return;
+	}
+
 	loadcolor(fg, 0, &cfg);
 
 	if (mode & ATTR_FAINT) {
 		cfg.red /= 2; cfg.green /= 2; cfg.blue /= 2;
 	}
-
-	fillrect(buf, px, py, cellw * w, cellh, &cbg);
 
 	if (mode & ATTR_INVISIBLE)
 		return;
@@ -577,12 +586,24 @@ rdraw(pixman_image_t *buf, int border)
 	loadcolor(DEFAULTBG, 1, &dbg);
 	fillrect(buf, 0, 0, bw, bh, &dbg);
 
+	/* Pass 1: alle Hintergründe füllen */
 	for (y = 0; y < term.row; y++) {
 		line = tgetline(y);
 		for (x = 0; x < term.col; x++) {
 			if (line[x].mode & ATTR_WDUMMY)
 				continue;
-			drawcell(buf, border + x * cellw, border + y * cellh, &line[x]);
+			drawcell(buf, border + x * cellw, border + y * cellh, &line[x], 0);
+		}
+	}
+	/* Pass 2: alle Glyphen/Dekorationen über die fertigen Hintergründe — so kann
+	 * ein überbreites Icon in die Nachbarzelle ragen, ohne danach von deren
+	 * Hintergrundfüllung wieder abgeschnitten zu werden. */
+	for (y = 0; y < term.row; y++) {
+		line = tgetline(y);
+		for (x = 0; x < term.col; x++) {
+			if (line[x].mode & ATTR_WDUMMY)
+				continue;
+			drawcell(buf, border + x * cellw, border + y * cellh, &line[x], 1);
 		}
 		term.dirty[y] = 0;
 	}
