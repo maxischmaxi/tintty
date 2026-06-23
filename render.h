@@ -27,4 +27,8 @@ void rdraw(pixman_image_t *buf, int borderpx_phys);
 /* erzwingt vollständiges Neuzeichnen beim nächsten rdraw */
 void rdirtyall(void);
 
+/* Hover-Link-Spanne (sichtbare Zell-Koordinaten) für die Unterstreichung
+ * setzen; sr < 0 = kein Link. Mehrzeilige Links als (sr,sc)..(er,ec). */
+void rset_link(int sr, int sc, int er, int ec);
+
 #endif /* RENDER_H */

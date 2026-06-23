@@ -54,6 +54,8 @@ typedef Glyph *Line;
 
 enum cursor_movement { CURSOR_SAVE, CURSOR_LOAD };
 enum cursor_state    { CURSOR_DEFAULT = 0, CURSOR_WRAPNEXT = 1, CURSOR_ORIGIN = 2 };
+/* DECSCUSR-Cursorform; Blink-Varianten werden auf die jeweilige Standform gemappt. */
+enum cursor_shape    { CURSOR_SHAPE_BLOCK = 0, CURSOR_SHAPE_UNDER, CURSOR_SHAPE_BAR };
 
 typedef struct {
 	Glyph attr; /* aktueller SGR-Zustand (Template für neue Zellen) */
@@ -88,6 +90,7 @@ typedef struct {
 	int ocx, ocy;     /* vorheriger Cursor (für Dirty) */
 	int top, bot;     /* Scroll-Region (inklusiv) */
 	int mode;         /* term_mode-Flags */
+	int cursorshape;  /* DECSCUSR: CURSOR_SHAPE_* */
 	int esc;          /* Escape-Parser-Zustand (intern) */
 	char trantbl[4];  /* Charset-Übersetzung G0..G3 (Finalbyte oder 0) */
 	int charset;      /* aktiver Charset-Slot (GL) */
@@ -120,6 +123,15 @@ void   kscrollup(int n);
 void   kscrolldown(int n);
 void   tresetfull(void);
 void   tclearall(void);
+
+/* Link an Zellposition (col,row in sichtbaren Koordinaten) erkennen. Gibt 1
+ * zurück und füllt out (URL, NUL-terminiert) sowie die Zell-Spanne
+ * (*sr,*sc)..(*er,*ec), die den Link überdeckt; sonst 0. Mehrzeilige Links
+ * (durch ATTR_WRAP umgebrochen) werden als eine Spanne erfasst. */
+int    turlat(int col, int row, char *out, size_t outsz,
+              int *sr, int *sc, int *er, int *ec);
+/* url in einem Hintergrundprozess (browser_cmd) öffnen. */
+void   uopen(const char *url);
 
 /* UTF-8 */
 size_t utf8encode(Rune u, char *c);

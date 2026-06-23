@@ -31,10 +31,14 @@ und wird einkompiliert (wie suckless st). Ändern = `config.h` editieren + `make
 | `Ctrl`+`+` / `-` / `0` | Schrift größer / kleiner / Reset |
 | `Ctrl`+Mausrad | Schrift stufenweise zoomen |
 | `Ctrl`+`Shift`+`R` / `L` | Hard Reset / Schirm + Scrollback leeren |
+| `Ctrl`+`V` / `Ctrl`+`Shift`+`V` | Einfügen aus der Zwischenablage |
+| Mittelklick | Einfügen aus der Primary Selection |
 
 Alle Shortcuts sind über Keysyms gebunden → layoutunabhängig (DE, US, …).
 Maus-Reporting (DECSET 9/1000/1002/1003, SGR 1006) geht an die App; `Shift`
-umgeht es. Copy/Paste bewusst nicht enthalten — läuft über tmux.
+umgeht es. Einfügen ist eingebaut (Bracketed-Paste-aware); `Ctrl`+`V` lässt
+sich via `paste_on_ctrl_v` abschalten (dann nur `Ctrl`+`Shift`+`V`, und `Ctrl`+`V`
+bleibt `0x16` für vim/readline). Kopieren läuft weiter extern (tmux, `wl-copy`).
 
 ## Architektur
 

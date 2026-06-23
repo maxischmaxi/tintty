@@ -2,7 +2,7 @@
 # User-Install (kein sudo). Für System-Install: make install PREFIX=/usr/local (mit sudo).
 PREFIX  ?= $(HOME)/.local
 APPDIR   = $(DESTDIR)$(PREFIX)/share/applications
-PKGS     = wayland-client xkbcommon freetype2 fontconfig pixman-1
+PKGS     = wayland-client wayland-cursor xkbcommon freetype2 fontconfig pixman-1
 
 WL_PROTO_DIR != pkg-config --variable=pkgdatadir wayland-protocols
 WL_SCANNER   != pkg-config --variable=wayland_scanner wayland-scanner
@@ -20,11 +20,13 @@ LIBS     = $(PKG_LIBS) -lutil -lrt -lm
 PROTO_H = xdg-shell-client-protocol.h \
           xdg-decoration-unstable-v1-client-protocol.h \
           fractional-scale-v1-client-protocol.h \
-          viewporter-client-protocol.h
+          viewporter-client-protocol.h \
+          primary-selection-unstable-v1-client-protocol.h
 PROTO_C = xdg-shell-protocol.c \
           xdg-decoration-unstable-v1-protocol.c \
           fractional-scale-v1-protocol.c \
-          viewporter-protocol.c
+          viewporter-protocol.c \
+          primary-selection-unstable-v1-protocol.c
 PROTO_O = $(PROTO_C:.c=.o)
 
 OBJ = tintty.o render.o wl.o $(PROTO_O)
@@ -50,6 +52,10 @@ viewporter-client-protocol.h:
 	$(WL_SCANNER) client-header $(WL_PROTO_DIR)/stable/viewporter/viewporter.xml $@
 viewporter-protocol.c:
 	$(WL_SCANNER) private-code $(WL_PROTO_DIR)/stable/viewporter/viewporter.xml $@
+primary-selection-unstable-v1-client-protocol.h:
+	$(WL_SCANNER) client-header $(WL_PROTO_DIR)/unstable/primary-selection/primary-selection-unstable-v1.xml $@
+primary-selection-unstable-v1-protocol.c:
+	$(WL_SCANNER) private-code $(WL_PROTO_DIR)/unstable/primary-selection/primary-selection-unstable-v1.xml $@
 
 # alle Objekte brauchen config.h + die generierten Header
 $(OBJ): config.h $(PROTO_H)

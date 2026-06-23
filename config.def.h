@@ -50,6 +50,14 @@ static const char *const default_shell = "/bin/sh"; /* nur Fallback; $SHELL hat 
 static const unsigned int tabspaces = 8;
 static const int allowaltscreen = 1;
 
+/* Befehl zum Öffnen geklickter Links (bekommt die URL als einziges Argument). */
+static const char *const browser_cmd = "xdg-open";
+
+/* Ctrl+V als Paste belegen (zusätzlich zu Ctrl+Shift+V und Mittelklick).
+ * 0 = nur Ctrl+Shift+V; Ctrl+V bleibt dann 0x16 (vim blockweise Auswahl,
+ * readline quoted-insert). */
+static const int paste_on_ctrl_v = 1;
+
 /* Draw-Coalescing (ms): nicht öfter als nötig neu zeichnen.
  * maxlatency deckelt die Zeichenrate bei Dauerausgabe: 16 ms ≈ 60 FPS. */
 static const double minlatency = 2.0;

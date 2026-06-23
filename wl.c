@@ -4,6 +4,7 @@
  */
 #define _GNU_SOURCE
 #include <errno.h>
+#include <fcntl.h>
 #include <locale.h>
 #include <math.h>
 #include <poll.h>
@@ -19,6 +20,7 @@
 
 #include <linux/input-event-codes.h>
 #include <wayland-client.h>
+#include <wayland-cursor.h>
 #include <xkbcommon/xkbcommon.h>
 #include <pixman.h>
 
@@ -26,6 +28,7 @@
 #include "xdg-decoration-unstable-v1-client-protocol.h"
 #include "fractional-scale-v1-client-protocol.h"
 #include "viewporter-client-protocol.h"
+#include "primary-selection-unstable-v1-client-protocol.h"
 
 #include "config.h"
 #include "tin.h"
@@ -53,6 +56,14 @@ static struct {
 	struct wp_fractional_scale_manager_v1 *frac_mgr;
 	struct wp_viewporter *viewporter;
 
+	/* Zwischenablage (nur Paste) */
+	struct wl_data_device_manager *dd_mgr;
+	struct wl_data_device *data_dev;
+	struct wl_data_offer *sel_offer;                  /* aktuelle Clipboard-Auswahl */
+	struct zwp_primary_selection_device_manager_v1 *psel_mgr;
+	struct zwp_primary_selection_device_v1 *psel_dev;
+	struct zwp_primary_selection_offer_v1 *psel_offer; /* aktuelle Primary-Auswahl */
+
 	struct wl_surface *surf;
 	struct xdg_surface *xsurf;
 	struct xdg_toplevel *toplevel;
@@ -68,6 +79,13 @@ static struct {
 	int shm_fd;
 	struct buffer bufs[2];
 	int bufw, bufh; /* aktuelle Puffergröße in physischen px */
+
+	/* Maus-Cursor (Theme) */
+	struct wl_cursor_theme *cur_theme;
+	struct wl_cursor *cur_default, *cur_hand;
+	struct wl_surface *cur_surf;
+	int cur_size, cur_scale;
+	uint32_t ptr_serial; /* letzter pointer-enter-serial (für set_cursor) */
 
 	/* xkb */
 	struct xkb_context *xkb_ctx;
@@ -94,6 +112,14 @@ static struct {
 static int      ptr_col = -1, ptr_row = -1;
 static uint32_t ptr_btn;                 /* bit0 links, bit1 mitte, bit2 rechts */
 static int      ptr_lcol = -1, ptr_lrow = -1; /* zuletzt gemeldet (Motion-Dedup) */
+
+/* Hover-Link-Zustand */
+#define URLBUF 4096
+static int      link_active;             /* steht der Pointer über einem Link? */
+static int      hl_sr, hl_sc, hl_er, hl_ec; /* aktuelle Hover-Spanne */
+static char     hl_url[URLBUF];          /* aktuell gehoverte URL */
+static int      press_link;              /* lag der linke Press über einem Link? */
+static char     press_url[URLBUF];       /* URL beim Press (für Press==Release-Check) */
 static int      ax_v120;                 /* akkumulierter Rest (value120) */
 static double   ax_cont;                 /* akkumulierter Rest (Touchpad) */
 static int      frame_v120, frame_cont_seen;
@@ -293,6 +319,224 @@ xsettitle(const char *title)
 		xdg_toplevel_set_title(g.toplevel, title && *title ? title : "tintty");
 }
 
+/* ------------------------------------------------------------------ Zwischenablage (Paste)
+ * tintty kann (v1) nur einfügen, nicht kopieren: Clipboard via wl_data_device,
+ * Primary Selection via zwp_primary_selection_device_v1. Jedes Offer trägt
+ * seinen bevorzugten Text-MIME-Typ als user_data (struct offer_state). */
+#define PASTE_MAX (8 * 1024 * 1024)
+
+struct offer_state {
+	int  rank;        /* 0 = noch kein brauchbarer Text-MIME gefunden */
+	char mime[96];
+};
+
+/* Höherer Rang = bevorzugt; 0 = kein Text-Typ (Paste wird zum No-op). */
+static int
+mime_rank(const char *m)
+{
+	if (!strcmp(m, "text/plain;charset=utf-8")) return 5;
+	if (!strcmp(m, "UTF8_STRING"))              return 4;
+	if (!strcmp(m, "text/plain"))               return 3;
+	if (!strcmp(m, "STRING"))                   return 2;
+	if (!strcmp(m, "TEXT"))                     return 1;
+	return 0;
+}
+
+static void
+offer_consider(struct offer_state *st, const char *mime)
+{
+	int r = mime_rank(mime);
+	if (st && r > st->rank) {
+		st->rank = r;
+		snprintf(st->mime, sizeof st->mime, "%s", mime);
+	}
+}
+
+/* --- wl_data_offer (Clipboard) --- */
+static void
+doffer_offer(void *data, struct wl_data_offer *o, const char *mime)
+{ (void)o; offer_consider(data, mime); }
+static void
+doffer_source_actions(void *data, struct wl_data_offer *o, uint32_t a)
+{ (void)data; (void)o; (void)a; }
+static void
+doffer_action(void *data, struct wl_data_offer *o, uint32_t a)
+{ (void)data; (void)o; (void)a; }
+
+static const struct wl_data_offer_listener doffer_listener = {
+	doffer_offer, doffer_source_actions, doffer_action,
+};
+
+/* --- zwp_primary_selection_offer_v1 (Primary) --- */
+static void
+poffer_offer(void *data, struct zwp_primary_selection_offer_v1 *o, const char *mime)
+{ (void)o; offer_consider(data, mime); }
+
+static const struct zwp_primary_selection_offer_v1_listener poffer_listener = {
+	poffer_offer,
+};
+
+/* --- wl_data_device (Clipboard-Selektion) --- */
+static void
+dd_data_offer(void *data, struct wl_data_device *dev, struct wl_data_offer *id)
+{
+	(void)data; (void)dev;
+	wl_data_offer_add_listener(id, &doffer_listener, calloc(1, sizeof(struct offer_state)));
+}
+static void
+dd_selection(void *data, struct wl_data_device *dev, struct wl_data_offer *id)
+{
+	(void)data; (void)dev;
+	if (g.sel_offer) {
+		free(wl_data_offer_get_user_data(g.sel_offer));
+		wl_data_offer_destroy(g.sel_offer);
+	}
+	g.sel_offer = id;
+}
+/* Kein Drag&Drop-Empfang: ein hereinkommendes Offer sofort verwerfen. */
+static void
+dd_enter(void *d, struct wl_data_device *dev, uint32_t s, struct wl_surface *sf,
+    wl_fixed_t x, wl_fixed_t y, struct wl_data_offer *id)
+{
+	(void)d; (void)dev; (void)s; (void)sf; (void)x; (void)y;
+	if (id) { free(wl_data_offer_get_user_data(id)); wl_data_offer_destroy(id); }
+}
+static void dd_leave(void *d, struct wl_data_device *dev) { (void)d; (void)dev; }
+static void dd_motion(void *d, struct wl_data_device *dev, uint32_t t,
+    wl_fixed_t x, wl_fixed_t y) { (void)d; (void)dev; (void)t; (void)x; (void)y; }
+static void dd_drop(void *d, struct wl_data_device *dev) { (void)d; (void)dev; }
+
+static const struct wl_data_device_listener dd_listener = {
+	dd_data_offer, dd_enter, dd_leave, dd_motion, dd_drop, dd_selection,
+};
+
+/* --- zwp_primary_selection_device_v1 (Primary-Selektion) --- */
+static void
+psel_data_offer(void *data, struct zwp_primary_selection_device_v1 *dev,
+    struct zwp_primary_selection_offer_v1 *id)
+{
+	(void)data; (void)dev;
+	zwp_primary_selection_offer_v1_add_listener(id, &poffer_listener,
+	    calloc(1, sizeof(struct offer_state)));
+}
+static void
+psel_selection(void *data, struct zwp_primary_selection_device_v1 *dev,
+    struct zwp_primary_selection_offer_v1 *id)
+{
+	(void)data; (void)dev;
+	if (g.psel_offer) {
+		free(zwp_primary_selection_offer_v1_get_user_data(g.psel_offer));
+		zwp_primary_selection_offer_v1_destroy(g.psel_offer);
+	}
+	g.psel_offer = id;
+}
+static const struct zwp_primary_selection_device_v1_listener psel_listener = {
+	psel_data_offer, psel_selection,
+};
+
+/* --- Paste-Kern --- */
+/* receive()-Trampoline: void* -> konkreter Offer-Typ (implizite C-Konvertierung). */
+static void do_recv_clip(void *o, const char *m, int fd) { wl_data_offer_receive(o, m, fd); }
+static void do_recv_prim(void *o, const char *m, int fd)
+{ zwp_primary_selection_offer_v1_receive(o, m, fd); }
+
+/* Offer-Inhalt blockierend in einen Puffer lesen (die Quelle schreibt
+ * asynchron, unabhängig von unserem Event-Dispatch -> kein Deadlock). */
+static char *
+clip_recv(void *offer, const char *mime, size_t *outlen,
+    void (*recv)(void *, const char *, int))
+{
+	int fds[2];
+	char *buf = NULL;
+	size_t cap = 0, len = 0;
+
+	*outlen = 0;
+	if (pipe2(fds, O_CLOEXEC) < 0)
+		return NULL;
+	recv(offer, mime, fds[1]);
+	close(fds[1]);
+	wl_display_flush(g.dpy);
+
+	for (;;) {
+		ssize_t r;
+		if (cap - len < 4096) {
+			size_t ncap = cap ? cap * 2 : 65536;
+			char *nb;
+			if (ncap > PASTE_MAX) ncap = PASTE_MAX;
+			if (ncap <= cap) break; /* Cap erreicht */
+			if (!(nb = realloc(buf, ncap))) break;
+			buf = nb;
+			cap = ncap;
+		}
+		r = read(fds[0], buf + len, cap - len);
+		if (r < 0) { if (errno == EINTR) continue; break; }
+		if (r == 0) break; /* EOF */
+		len += (size_t)r;
+	}
+	close(fds[0]);
+	*outlen = len;
+	return buf;
+}
+
+/* Puffer ans PTY. Im Bracketed-Paste-Modus wrappen und einen eingebetteten
+ * Terminator \e[201~ herausfiltern (sonst könnte Inhalt aus dem Paste
+ * ausbrechen). */
+static void
+clip_send(const char *buf, size_t len)
+{
+	if (!buf || len == 0)
+		return;
+	if (term.mode & MODE_BRCKTPASTE) {
+		size_t i, start = 0;
+		ttywrite("\033[200~", 6, 0);
+		for (i = 0; i + 6 <= len; ) {
+			if (!memcmp(buf + i, "\033[201~", 6)) {
+				if (i > start) ttywrite(buf + start, i - start, 0);
+				start = i += 6;
+			} else
+				i++;
+		}
+		if (len > start) ttywrite(buf + start, len - start, 0);
+		ttywrite("\033[201~", 6, 0);
+	} else {
+		ttywrite(buf, len, 0);
+	}
+}
+
+static void
+clip_paste_clipboard(void)
+{
+	struct offer_state *st;
+	char *buf;
+	size_t len;
+
+	if (!g.sel_offer)
+		return;
+	st = wl_data_offer_get_user_data(g.sel_offer);
+	if (!st || st->rank == 0)
+		return;
+	buf = clip_recv(g.sel_offer, st->mime, &len, do_recv_clip);
+	clip_send(buf, len);
+	free(buf);
+}
+
+static void
+clip_paste_primary(void)
+{
+	struct offer_state *st;
+	char *buf;
+	size_t len;
+
+	if (!g.psel_offer)
+		return;
+	st = zwp_primary_selection_offer_v1_get_user_data(g.psel_offer);
+	if (!st || st->rank == 0)
+		return;
+	buf = clip_recv(g.psel_offer, st->mime, &len, do_recv_prim);
+	clip_send(buf, len);
+	free(buf);
+}
+
 /* ------------------------------------------------------------------ Tastatur */
 static int
 modon(const char *name)
@@ -442,6 +686,10 @@ onkey(uint32_t code)
 		case XKB_KEY_KP_Subtract: do_zoom(-1); return;
 		case XKB_KEY_0:
 		case XKB_KEY_KP_0:        do_zoom(0);  return;
+		case XKB_KEY_V:           clip_paste_clipboard(); return; /* Ctrl+Shift+V */
+		case XKB_KEY_v:           /* Ctrl+V: optional als Paste */
+			if (paste_on_ctrl_v) { clip_paste_clipboard(); return; }
+			break;
 		}
 	}
 
@@ -613,6 +861,94 @@ mouse_send(int code, int col, int row, int release)
 	ttywrite(buf, len, 0);
 }
 
+/* Cursor-Theme in der zum aktuellen Scale passenden Größe laden (idempotent). */
+static void
+cursor_load(void)
+{
+	int s = (g.scale120 + 60) / 120;
+	int size;
+
+	if (s < 1)
+		s = 1;
+	size = 24 * s;
+	if (g.cur_theme && g.cur_size == size)
+		return;
+	if (g.cur_theme)
+		wl_cursor_theme_destroy(g.cur_theme);
+	g.cur_theme = wl_cursor_theme_load(NULL, size, g.shm);
+	g.cur_size = size;
+	g.cur_scale = s;
+	g.cur_default = g.cur_hand = NULL;
+	if (g.cur_theme) {
+		static const char *const dn[] = { "left_ptr", "default", "arrow" };
+		static const char *const hn[] = { "pointer", "hand2", "hand1", "hand" };
+		size_t i;
+		for (i = 0; i < LEN(dn) && !g.cur_default; i++)
+			g.cur_default = wl_cursor_theme_get_cursor(g.cur_theme, dn[i]);
+		for (i = 0; i < LEN(hn) && !g.cur_hand; i++)
+			g.cur_hand = wl_cursor_theme_get_cursor(g.cur_theme, hn[i]);
+	}
+	if (!g.cur_surf && g.comp)
+		g.cur_surf = wl_compositor_create_surface(g.comp);
+}
+
+/* Mauszeiger setzen: hand!=0 -> Hand-Cursor (über Link), sonst Standard. */
+static void
+cursor_apply(int hand)
+{
+	struct wl_cursor *cur = hand ? g.cur_hand : g.cur_default;
+	struct wl_cursor_image *img;
+	struct wl_buffer *b;
+	int sc = g.cur_scale < 1 ? 1 : g.cur_scale;
+
+	if (!g.ptr || !g.cur_surf)
+		return;
+	if (!cur)
+		cur = g.cur_default;
+	if (!cur || !cur->image_count)
+		return;
+	img = cur->images[0];
+	b = wl_cursor_image_get_buffer(img);
+	if (!b)
+		return;
+	wl_surface_set_buffer_scale(g.cur_surf, sc);
+	wl_surface_attach(g.cur_surf, b, 0, 0);
+	wl_surface_damage_buffer(g.cur_surf, 0, 0, img->width, img->height);
+	wl_surface_commit(g.cur_surf);
+	wl_pointer_set_cursor(g.ptr, g.ptr_serial, g.cur_surf,
+	    img->hotspot_x / sc, img->hotspot_y / sc);
+}
+
+/* Link unter dem Pointer neu bestimmen; bei Änderung Unterstreichung,
+ * Cursorform und Redraw aktualisieren. */
+static void
+link_update(void)
+{
+	char url[URLBUF];
+	int sr, sc, er, ec, hit;
+
+	hit = ptr_col >= 0 && ptr_row >= 0 &&
+	      turlat(ptr_col, ptr_row, url, sizeof url, &sr, &sc, &er, &ec);
+
+	if (hit && link_active &&
+	    sr == hl_sr && sc == hl_sc && er == hl_er && ec == hl_ec)
+		return; /* unveränderter Link */
+	if (!hit && !link_active)
+		return; /* war und ist kein Link */
+
+	if (hit) {
+		link_active = 1;
+		hl_sr = sr; hl_sc = sc; hl_er = er; hl_ec = ec;
+		snprintf(hl_url, sizeof hl_url, "%s", url);
+		rset_link(sr, sc, er, ec);
+	} else {
+		link_active = 0;
+		rset_link(-1, 0, 0, 0);
+	}
+	cursor_apply(link_active);
+	g.need_redraw = 1;
+}
+
 static void
 ptr_setpos(wl_fixed_t fx, wl_fixed_t fy)
 {
@@ -667,6 +1003,30 @@ ptr_report_button(int btn, int pressed)
 	if (pressed) ptr_btn |= (1u << b);
 	else ptr_btn &= ~(1u << b);
 
+	/* Mittelklick fügt die Primary Selection ein — aber nur, wenn der Klick
+	 * ohnehin nicht an die App gemeldet würde (kein Maus-Modus oder Shift-Bypass). */
+	if (btn == BTN_MIDDLE && pressed &&
+	    (!(term.mode & MODE_MOUSE) || modon(XKB_MOD_NAME_SHIFT))) {
+		clip_paste_primary();
+		return;
+	}
+
+	/* Linksklick auf einen gehoverten Link öffnet ihn beim Loslassen, wenn
+	 * Press und Release über demselben Link lagen. Im App-Maus-Modus nur mit
+	 * Shift (sonst geht der Klick wie gewohnt an die Anwendung). */
+	if (btn == BTN_LEFT &&
+	    (!(term.mode & MODE_MOUSE) || modon(XKB_MOD_NAME_SHIFT))) {
+		if (pressed) {
+			press_link = link_active;
+			if (link_active)
+				snprintf(press_url, sizeof press_url, "%s", hl_url);
+		} else {
+			if (press_link && link_active && !strcmp(press_url, hl_url))
+				uopen(hl_url);
+			press_link = 0;
+		}
+	}
+
 	if (!(term.mode & MODE_MOUSE) || modon(XKB_MOD_NAME_SHIFT))
 		return;
 
@@ -707,6 +1067,7 @@ ptr_wheel(int notches)
 	} else {
 		if (up) kscrollup(n * 3);
 		else kscrolldown(n * 3);
+		link_update(); /* Inhalt unter dem Pointer hat sich verschoben */
 		g.need_redraw = 1;
 	}
 }
@@ -715,20 +1076,30 @@ static void
 p_enter(void *d, struct wl_pointer *p, uint32_t serial, struct wl_surface *s,
     wl_fixed_t sx, wl_fixed_t sy)
 {
-	(void)d; (void)p; (void)serial; (void)s;
+	(void)d; (void)p; (void)s;
+	g.ptr_serial = serial;
 	ptr_setpos(sx, sy);
+	cursor_apply(0); /* Compositor erwartet nach enter ein set_cursor */
+	link_update();
 }
 static void
 p_leave(void *d, struct wl_pointer *p, uint32_t serial, struct wl_surface *s)
 {
 	(void)d; (void)p; (void)serial; (void)s;
 	ptr_btn = 0;
+	ptr_col = ptr_row = -1;
+	if (link_active) {
+		link_active = 0;
+		rset_link(-1, 0, 0, 0);
+		g.need_redraw = 1;
+	}
 }
 static void
 p_motion(void *d, struct wl_pointer *p, uint32_t t, wl_fixed_t sx, wl_fixed_t sy)
 {
 	(void)d; (void)p; (void)t;
 	ptr_setpos(sx, sy);
+	link_update();
 	ptr_report_motion();
 }
 static void
@@ -901,6 +1272,7 @@ frac_preferred(void *d, struct wp_fractional_scale_v1 *f, uint32_t scale)
 		return;
 	g.scale120 = scale;
 	rsetscale(scale / 120.0);
+	cursor_load();
 	if (g.configured) {
 		g.bufw = g.bufh = 0; /* Rebuild der Puffer erzwingen */
 		configure_size(g.cfg_w, g.cfg_h);
@@ -938,6 +1310,11 @@ reg_global(void *d, struct wl_registry *r, uint32_t name, const char *iface,
 		    &wp_fractional_scale_manager_v1_interface, 1);
 	} else if (!strcmp(iface, wp_viewporter_interface.name)) {
 		g.viewporter = wl_registry_bind(r, name, &wp_viewporter_interface, 1);
+	} else if (!strcmp(iface, wl_data_device_manager_interface.name)) {
+		g.dd_mgr = wl_registry_bind(r, name, &wl_data_device_manager_interface, MIN(ver, 3));
+	} else if (!strcmp(iface, zwp_primary_selection_device_manager_v1_interface.name)) {
+		g.psel_mgr = wl_registry_bind(r, name,
+		    &zwp_primary_selection_device_manager_v1_interface, 1);
 	}
 }
 static void reg_remove(void *d, struct wl_registry *r, uint32_t name)
@@ -1062,8 +1439,19 @@ main(void)
 
 	g.have_frac = (g.frac_mgr != NULL && g.viewporter != NULL);
 
+	/* Datengeräte für Paste (Clipboard + Primary Selection). */
+	if (g.dd_mgr && g.seat) {
+		g.data_dev = wl_data_device_manager_get_data_device(g.dd_mgr, g.seat);
+		wl_data_device_add_listener(g.data_dev, &dd_listener, NULL);
+	}
+	if (g.psel_mgr && g.seat) {
+		g.psel_dev = zwp_primary_selection_device_manager_v1_get_device(g.psel_mgr, g.seat);
+		zwp_primary_selection_device_v1_add_listener(g.psel_dev, &psel_listener, NULL);
+	}
+
 	wl_display_roundtrip(g.dpy); /* Output-Scale (nur Integer-Fallback) */
 	rsetscale(g.scale120 / 120.0);
+	cursor_load();
 
 	/* Core + PTY vor der Surface anlegen, damit configure resizen kann */
 	tnew(default_cols, default_rows);
@@ -1097,6 +1485,8 @@ main(void)
 
 	destroy_buffers();
 	rfree();
+	if (g.cur_theme)
+		wl_cursor_theme_destroy(g.cur_theme);
 	wl_display_disconnect(g.dpy);
 	return 0;
 }

@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 #include <wchar.h>
 #include <sys/ioctl.h>
@@ -29,6 +30,7 @@
 
 #define ESC_BUF_SIZ  (128 * UTF_SIZ)
 #define ESC_ARG_SIZ  16
+#define URL_MAX      1024 /* max. Runen eines erkannten Links */
 #define STR_BUF_SIZ  ESC_BUF_SIZ
 #define STR_ARG_SIZ  ESC_ARG_SIZ
 
@@ -299,6 +301,38 @@ ttyhangup(void)
 }
 
 void
+uopen(const char *url)
+{
+	char buf[URL_MAX + 8];
+	pid_t p;
+
+	if (!url || !*url)
+		return;
+
+	/* schema-loses www.-Token als https:// öffnen */
+	if (!strncasecmp(url, "www.", 4)) {
+		snprintf(buf, sizeof buf, "https://%s", url);
+		url = buf;
+	}
+
+	/* Doppel-fork: der Enkel wird von init adoptiert -> kein Zombie und
+	 * unabhängig vom SIGCHLD-Handler, der nur die Shell-pid reapt. */
+	if ((p = fork()) < 0)
+		return;
+	if (p == 0) {
+		if (fork() == 0) {
+			setsid();
+			signal(SIGCHLD, SIG_DFL);
+			signal(SIGHUP, SIG_DFL);
+			execlp(browser_cmd, browser_cmd, url, (char *)NULL);
+			_exit(127);
+		}
+		_exit(0);
+	}
+	waitpid(p, NULL, 0);
+}
+
+void
 ttywrite(const char *s, size_t n, int may_echo)
 {
 	(void)may_echo;
@@ -382,6 +416,185 @@ tgetline(int y)
 #else
 	return term.line[y];
 #endif
+}
+
+/* ------------------------------------------------------------------ Links */
+/* Begrenzer eines URL-Tokens: Leerzeichen, Tab oder leere Zelle. */
+static int
+urlsep(Rune u)
+{
+	return u == 0 || u == ' ' || u == '\t';
+}
+
+/* Vorige sichtbare, nicht-WDUMMY-Zelle innerhalb der logischen (per ATTR_WRAP
+ * verbundenen) Zeile. 0 = es gibt keine. */
+static int
+cellprev(int *r, int *c)
+{
+	int rr = *r, cc = *c;
+	do {
+		if (cc > 0)
+			cc--;
+		else if (rr > 0 && (tgetline(rr - 1)[term.col - 1].mode & ATTR_WRAP)) {
+			rr--;
+			cc = term.col - 1;
+		} else
+			return 0;
+	} while (tgetline(rr)[cc].mode & ATTR_WDUMMY);
+	*r = rr;
+	*c = cc;
+	return 1;
+}
+
+/* Nächste sichtbare, nicht-WDUMMY-Zelle innerhalb der logischen Zeile. */
+static int
+cellnext(int *r, int *c)
+{
+	int rr = *r, cc = *c;
+	do {
+		if (cc < term.col - 1)
+			cc++;
+		else if (rr < term.row - 1 && (tgetline(rr)[term.col - 1].mode & ATTR_WRAP)) {
+			rr++;
+			cc = 0;
+		} else
+			return 0;
+	} while (tgetline(rr)[cc].mode & ATTR_WDUMMY);
+	*r = rr;
+	*c = cc;
+	return 1;
+}
+
+/* Beginnt ab Index i ein bekanntes URL-Schema (case-insensitiv)? */
+static int
+url_scheme_at(const Rune *run, int n, int i)
+{
+	static const char *const sch[] = {
+		"http://", "https://", "mailto:", "file://", "www.",
+	};
+	size_t k;
+
+	for (k = 0; k < LEN(sch); k++) {
+		const char *p = sch[k];
+		int j = 0;
+		while (p[j] && i + j < n) {
+			Rune a = run[i + j];
+			if (a >= 'A' && a <= 'Z')
+				a += 32;
+			if (a != (Rune)p[j])
+				break;
+			j++;
+		}
+		if (!p[j])
+			return 1;
+	}
+	return 0;
+}
+
+int
+turlat(int col, int row, char *out, size_t outsz,
+       int *sr, int *sc, int *er, int *ec)
+{
+	static struct { int r, c; } pos[URL_MAX];
+	static Rune run[URL_MAX];
+	int n, i, start, hit, r, c, found;
+	size_t off;
+
+	if (term.col <= 0 || term.row <= 0)
+		return 0;
+	LIMIT(col, 0, term.col - 1);
+	LIMIT(row, 0, term.row - 1);
+
+	/* Auf WDUMMY (2. Hälfte eines Wide-Chars) auf die WIDE-Zelle zurück. */
+	if ((tgetline(row)[col].mode & ATTR_WDUMMY) && col > 0)
+		col--;
+	if (urlsep(tgetline(row)[col].u))
+		return 0;
+
+	/* Token-Anfang suchen (rückwärts bis Trenner / Zeilenanfang). */
+	r = row;
+	c = col;
+	for (;;) {
+		int pr = r, pc = c;
+		if (!cellprev(&pr, &pc) || urlsep(tgetline(pr)[pc].u))
+			break;
+		r = pr;
+		c = pc;
+	}
+
+	/* Token vorwärts sammeln; Index der Zielzelle merken. */
+	n = 0;
+	hit = -1;
+	for (;;) {
+		Rune u = tgetline(r)[c].u;
+		if (urlsep(u) || n >= URL_MAX)
+			break;
+		if (r == row && c == col)
+			hit = n;
+		pos[n].r = r;
+		pos[n].c = c;
+		run[n] = u;
+		n++;
+		if (!cellnext(&r, &c))
+			break;
+	}
+	if (hit < 0)
+		return 0;
+
+	/* Erstes Schema-Vorkommen im Token (überspringt z.B. führende Klammer). */
+	found = 0;
+	for (start = 0; start < n; start++)
+		if (url_scheme_at(run, n, start)) {
+			found = 1;
+			break;
+		}
+	if (!found)
+		return 0;
+
+	/* Trailing-Punktuation und unbalancierte schließende Klammern trimmen. */
+	while (n > start) {
+		Rune last = run[n - 1];
+		if (last == '.' || last == ',' || last == ';' || last == ':' ||
+		    last == '!' || last == '?') {
+			n--;
+			continue;
+		}
+		if (last == ')' || last == ']' || last == '}' || last == '>') {
+			Rune op = last == ')' ? '(' : last == ']' ? '[' :
+			          last == '}' ? '{' : '<';
+			int depth = 0, k;
+			for (k = start; k < n; k++)
+				depth += (run[k] == op) - (run[k] == last);
+			if (depth < 0) {
+				n--;
+				continue;
+			}
+		}
+		break;
+	}
+
+	/* Zielzelle muss nach dem Trimmen noch im Link liegen. */
+	if (hit < start || hit >= n)
+		return 0;
+
+	off = 0;
+	for (i = start; i < n; i++) {
+		char tmp[UTF_SIZ];
+		size_t l = utf8encode(run[i], tmp);
+		if (off + l + 1 > outsz)
+			break;
+		memcpy(out + off, tmp, l);
+		off += l;
+	}
+	if (off == 0)
+		return 0;
+	out[off] = '\0';
+
+	*sr = pos[start].r;
+	*sc = pos[start].c;
+	*er = pos[n - 1].r;
+	*ec = pos[n - 1].c;
+	return 1;
 }
 
 static void
@@ -617,6 +830,7 @@ treset(void)
 	term.top = 0;
 	term.bot = term.row - 1;
 	term.mode = MODE_WRAP;
+	term.cursorshape = CURSOR_SHAPE_BLOCK;
 	memset(term.trantbl, 0, sizeof(term.trantbl));
 	term.charset = 0;
 
@@ -1120,7 +1334,15 @@ csihandle(void)
 	case 'u': /* DECRC -- restore cursor */
 		tcursor(CURSOR_LOAD);
 		break;
-	case 'q': /* DECSCUSR -- cursor style: fix Block, ignorieren */
+	case ' ': /* DECSCUSR -- cursor style: CSI Ps SP q */
+		if (csiescseq.mode[1] == 'q') {
+			switch (csiescseq.arg[0]) {
+			case 0: case 1: case 2: term.cursorshape = CURSOR_SHAPE_BLOCK; break;
+			case 3: case 4:         term.cursorshape = CURSOR_SHAPE_UNDER; break;
+			case 5: case 6:         term.cursorshape = CURSOR_SHAPE_BAR;   break;
+			}
+		}
+		break;
 	case 't': /* window ops -- ignorieren */
 	case 'p': /* soft reset etc -- ignorieren */
 		break;

@@ -507,6 +507,32 @@ drawglyph(pixman_image_t *buf, int px, int py, Rune u, uint16_t mode,
 	}
 }
 
+/* Hover-Link-Spanne (sichtbare Zell-Koordinaten); link_sr < 0 = kein Link. */
+static int link_sr = -1, link_sc, link_er, link_ec;
+
+void
+rset_link(int sr, int sc, int er, int ec)
+{
+	link_sr = sr;
+	link_sc = sc;
+	link_er = er;
+	link_ec = ec;
+}
+
+/* Liegt Zelle (x,y) in der Hover-Link-Spanne? Mehrzeilig: erste Zeile ab sc,
+ * letzte bis ec, Zwischenzeilen vollständig. */
+static int
+in_link(int x, int y)
+{
+	if (link_sr < 0 || y < link_sr || y > link_er)
+		return 0;
+	if (y == link_sr && x < link_sc)
+		return 0;
+	if (y == link_er && x > link_ec)
+		return 0;
+	return 1;
+}
+
 /* Zwei-Pass-Rendering: fg_pass==0 zeichnet nur den Hintergrund, fg_pass==1 nur
  * Glyph + Dekorationen. Grund: überbreite Glyphen (Nerd-Font-Icons, Emoji) ragen
  * über ihre Zelle hinaus. Würde wie früher pro Zelle erst bg, dann glyph gezeichnet,
@@ -514,7 +540,7 @@ drawglyph(pixman_image_t *buf, int px, int py, Rune u, uint16_t mode,
  * abgeschnitten"). Indem rdraw() erst ALLE Hintergründe und dann ALLE Glyphen malt,
  * bleibt der Überstand erhalten und das Icon ist vollständig sichtbar. */
 static void
-drawcell(pixman_image_t *buf, int px, int py, const Glyph *gp, int fg_pass)
+drawcell(pixman_image_t *buf, int px, int py, const Glyph *gp, int fg_pass, int linkul)
 {
 	uint32_t fg = gp->fg, bg = gp->bg, t;
 	uint16_t mode = gp->mode;
@@ -543,7 +569,7 @@ drawcell(pixman_image_t *buf, int px, int py, const Glyph *gp, int fg_pass)
 	if (gp->u && gp->u != ' ')
 		drawglyph(buf, px, py, gp->u, mode, &cfg);
 
-	if (mode & ATTR_UNDERLINE)
+	if ((mode & ATTR_UNDERLINE) || linkul)
 		fillrect(buf, px, py + baseline + 1, cellw * w, MAX(1, cur_scale), &cfg);
 	if (mode & ATTR_STRUCK)
 		fillrect(buf, px, py + baseline * 2 / 3, cellw * w, MAX(1, cur_scale), &cfg);
@@ -556,7 +582,7 @@ drawcursor(pixman_image_t *buf, int border)
 	Line line = tgetline(cy);
 	Glyph g;
 	pixman_color_t cbg, cfg;
-	int w;
+	int w, px, py, thick;
 
 	if (cx > 0 && (line[cx].mode & ATTR_WDUMMY))
 		cx--;
@@ -566,9 +592,25 @@ drawcursor(pixman_image_t *buf, int border)
 	loadcolor(DEFAULTCS, 0, &cbg);
 	loadcolor(DEFAULTCSFG, 0, &cfg);
 
-	fillrect(buf, border + cx * cellw, border + cy * cellh, cellw * w, cellh, &cbg);
-	if (g.u && g.u != ' ')
-		drawglyph(buf, border + cx * cellw, border + cy * cellh, g.u, g.mode, &cfg);
+	px = border + cx * cellw;
+	py = border + cy * cellh;
+	thick = MAX(1, (int)(cur_scale * 2 + 0.5));
+
+	switch (term.cursorshape) {
+	case CURSOR_SHAPE_BAR:
+		/* schmaler Balken am linken Zellenrand; Glyph bleibt normal gezeichnet */
+		fillrect(buf, px, py, thick, cellh, &cbg);
+		break;
+	case CURSOR_SHAPE_UNDER:
+		/* Unterstrich am unteren Zellenrand */
+		fillrect(buf, px, py + cellh - thick, cellw * w, thick, &cbg);
+		break;
+	default: /* CURSOR_SHAPE_BLOCK */
+		fillrect(buf, px, py, cellw * w, cellh, &cbg);
+		if (g.u && g.u != ' ')
+			drawglyph(buf, px, py, g.u, g.mode, &cfg);
+		break;
+	}
 }
 
 void
@@ -592,7 +634,7 @@ rdraw(pixman_image_t *buf, int border)
 		for (x = 0; x < term.col; x++) {
 			if (line[x].mode & ATTR_WDUMMY)
 				continue;
-			drawcell(buf, border + x * cellw, border + y * cellh, &line[x], 0);
+			drawcell(buf, border + x * cellw, border + y * cellh, &line[x], 0, 0);
 		}
 	}
 	/* Pass 2: alle Glyphen/Dekorationen über die fertigen Hintergründe — so kann
@@ -603,7 +645,8 @@ rdraw(pixman_image_t *buf, int border)
 		for (x = 0; x < term.col; x++) {
 			if (line[x].mode & ATTR_WDUMMY)
 				continue;
-			drawcell(buf, border + x * cellw, border + y * cellh, &line[x], 1);
+			drawcell(buf, border + x * cellw, border + y * cellh, &line[x], 1,
+			    in_link(x, y));
 		}
 		term.dirty[y] = 0;
 	}
