@@ -136,6 +136,20 @@ die(const char *fmt, ...)
 	exit(1);
 }
 
+/* TEMP: Link-Klick-Diagnose nach /tmp/tintty-link.log */
+static void
+linkdbg(const char *fmt, ...)
+{
+	FILE *f = fopen("/tmp/tintty-link.log", "a");
+	va_list ap;
+	if (!f)
+		return;
+	va_start(ap, fmt);
+	vfprintf(f, fmt, ap);
+	va_end(ap);
+	fclose(f);
+}
+
 /* ------------------------------------------------------------------ Puffer */
 static int
 alloc_shm(size_t size)
@@ -1011,6 +1025,12 @@ ptr_report_button(int btn, int pressed)
 		return;
 	}
 
+	if (btn == BTN_LEFT)
+		linkdbg("btnL pressed=%d mode_mouse=%d shift=%d link_active=%d "
+		    "press_link=%d hl_url=\"%s\" press_url=\"%s\"\n",
+		    pressed, !!(term.mode & MODE_MOUSE), modon(XKB_MOD_NAME_SHIFT),
+		    link_active, press_link, hl_url, press_url);
+
 	/* Linksklick auf einen gehoverten Link öffnet ihn beim Loslassen, wenn
 	 * Press und Release über demselben Link lagen. Im App-Maus-Modus nur mit
 	 * Shift (sonst geht der Klick wie gewohnt an die Anwendung). */
@@ -1021,8 +1041,12 @@ ptr_report_button(int btn, int pressed)
 			if (link_active)
 				snprintf(press_url, sizeof press_url, "%s", hl_url);
 		} else {
-			if (press_link && link_active && !strcmp(press_url, hl_url))
+			if (press_link && link_active && !strcmp(press_url, hl_url)) {
+				linkdbg("  -> uopen(\"%s\")\n", hl_url);
 				uopen(hl_url);
+			} else {
+				linkdbg("  -> KEIN uopen (Bedingung false)\n");
+			}
 			press_link = 0;
 		}
 	}

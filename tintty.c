@@ -315,6 +315,8 @@ uopen(const char *url)
 		url = buf;
 	}
 
+	fprintf(stderr, "[tintty DEBUG] uopen: %s \"%s\"\n", browser_cmd, url);
+
 	/* Doppel-fork: der Enkel wird von init adoptiert -> kein Zombie und
 	 * unabhängig vom SIGCHLD-Handler, der nur die Shell-pid reapt. */
 	if ((p = fork()) < 0)
@@ -325,6 +327,8 @@ uopen(const char *url)
 			signal(SIGCHLD, SIG_DFL);
 			signal(SIGHUP, SIG_DFL);
 			execlp(browser_cmd, browser_cmd, url, (char *)NULL);
+			fprintf(stderr, "[tintty DEBUG] execlp(%s) fehlgeschlagen: %s\n",
+			    browser_cmd, strerror(errno));
 			_exit(127);
 		}
 		_exit(0);
