@@ -1,0 +1,10 @@
+# Build-Artefakte
+*.o
+/tintty
+
+# lokale Konfiguration (Makefile kopiert config.def.h -> config.h)
+/config.h
+
+# von wayland-scanner generierter Protokoll-Glue (siehe Makefile)
+*-protocol.c
+*-client-protocol.h
