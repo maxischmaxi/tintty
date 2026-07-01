@@ -136,11 +136,18 @@ loadcolor(uint32_t c, int isbg, pixman_color_t *out)
 	} else {
 		*out = palette[7];
 	}
-	if (isbg)
-		out->alpha = (c == (uint32_t)DEFAULTBG)
-		    ? (uint16_t)(bg_opacity * 0xffff) : 0xffff;
-	else
+	if (isbg && c == (uint32_t)DEFAULTBG) {
+		/* pixman interpretiert pixman_color_t als premultipliziert:
+		 * RGB muss mit dem Alpha skaliert werden, sonst wirkt der
+		 * transparente Hintergrund heller als konfiguriert. */
+		uint32_t a = (uint32_t)(bg_opacity * 0xffff);
+		out->alpha = (uint16_t)a;
+		out->red   = (uint16_t)((uint32_t)out->red   * a / 0xffff);
+		out->green = (uint16_t)((uint32_t)out->green * a / 0xffff);
+		out->blue  = (uint16_t)((uint32_t)out->blue  * a / 0xffff);
+	} else {
 		out->alpha = 0xffff;
+	}
 }
 
 static pixman_image_t *
@@ -242,11 +249,18 @@ freecache(Face *f)
 static void
 freefonts(void)
 {
-	int i;
-	for (i = 0; i < 4; i++) {
+	int i, j;
+	for (i = 0; i < 4; i++)
 		freecache(&pri[i]);
-		if (pri[i].ft)
-			FT_Done_Face(pri[i].ft);
+	/* Stile können auf dieselbe FT_Face zurückfallen (fehlender Bold/Italic)
+	 * — Duplikate ausnullen, damit FT_Done_Face nur einmal läuft. */
+	for (i = 0; i < 4; i++) {
+		if (!pri[i].ft)
+			continue;
+		for (j = i + 1; j < 4; j++)
+			if (pri[j].ft == pri[i].ft)
+				pri[j].ft = NULL;
+		FT_Done_Face(pri[i].ft);
 		pri[i].ft = NULL;
 	}
 	for (i = 0; i < frclen; i++) {
@@ -355,8 +369,15 @@ findfallback(Rune u)
 	}
 	frc[frclen].face.ft = face;
 	frc[frclen].face.glyphs = NULL;
-	frc[frclen].set = FcCharSetCreate();
-	FcCharSetAddChar(frc[frclen].set, u);
+	/* Volle Abdeckung des Fonts cachen, nicht nur die eine Rune: sonst legt
+	 * jede weitere Rune desselben Fonts einen neuen Eintrag samt neuer
+	 * FT_Face an, und bei > FRC_MAX verschiedenen Glyphen thrasht der Cache
+	 * mit fontconfig-Lookups pro Zelle und Frame. */
+	frc[frclen].set = FcFreeTypeCharSet(face, NULL);
+	if (!frc[frclen].set) {
+		frc[frclen].set = FcCharSetCreate();
+		FcCharSetAddChar(frc[frclen].set, u);
+	}
 	return &frc[frclen++].face;
 }
 
@@ -370,14 +391,21 @@ getglyph(Face *f, FT_UInt gi)
 	int y, stride;
 	uint8_t *data;
 
+	/* leerer Slot als OOM-Fallback: img==NULL -> wird nie gezeichnet */
+	static GlyphSlot emptyslot;
+
 	if (gi >= (FT_UInt)f->ft->num_glyphs)
 		gi = 0;
 	if (!f->glyphs)
 		f->glyphs = calloc(f->ft->num_glyphs, sizeof(GlyphSlot *));
+	if (!f->glyphs)
+		return &emptyslot;
 	if ((s = f->glyphs[gi]))
 		return s;
 
 	s = calloc(1, sizeof(GlyphSlot));
+	if (!s)
+		return &emptyslot;
 	{
 		int32_t flags = FT_LOAD_RENDER |
 		    (FT_HAS_COLOR(f->ft) ? FT_LOAD_COLOR : FT_LOAD_TARGET_LIGHT);
@@ -405,34 +433,50 @@ getglyph(Face *f, FT_UInt gi)
 		double sc = (double)cellh / sh;
 		stride = sw * 4;
 		data = malloc((size_t)stride * sh);
+		if (!data) {
+			f->glyphs[gi] = s;
+			return s;
+		}
 		for (y = 0; y < sh; y++)
 			memcpy(data + (size_t)y * stride, bm->buffer + (size_t)y * bm->pitch,
 			    (size_t)sw * 4);
 		pixman_image_t *raw = pixman_image_create_bits(PIXMAN_a8r8g8b8, sw, sh,
 		    (uint32_t *)data, stride);
+		if (!raw) {
+			free(data);
+			f->glyphs[gi] = s;
+			return s;
+		}
 
 		if (sc < 0.98 || sc > 1.02) {
 			int dw = MAX(1, (int)lround(sw * sc));
 			int dh = MAX(1, (int)lround(sh * sc));
 			int dstride = dw * 4;
 			uint8_t *ddata = calloc((size_t)dstride, dh);
-			pixman_image_t *dst = pixman_image_create_bits(PIXMAN_a8r8g8b8,
-			    dw, dh, (uint32_t *)ddata, dstride);
-			pixman_transform_t t;
-			pixman_transform_init_scale(&t, pixman_double_to_fixed(1.0 / sc),
-			    pixman_double_to_fixed(1.0 / sc));
-			pixman_image_set_transform(raw, &t);
-			pixman_image_set_filter(raw, PIXMAN_FILTER_BILINEAR, NULL, 0);
-			pixman_image_composite32(PIXMAN_OP_SRC, raw, NULL, dst,
-			    0, 0, 0, 0, 0, 0, dw, dh);
-			pixman_image_unref(raw);
-			free(data);
-			s->img = dst;
-			s->data = ddata;
-			s->w = dw;
-			s->h = dh;
-			s->left = (int)lround(s->left * sc);
-			s->top = (int)lround(s->top * sc);
+			pixman_image_t *dst = ddata ? pixman_image_create_bits(
+			    PIXMAN_a8r8g8b8, dw, dh, (uint32_t *)ddata, dstride) : NULL;
+			if (!dst) {
+				/* OOM: unskaliert weiterverwenden statt abzustürzen */
+				free(ddata);
+				s->img = raw;
+				s->data = data;
+			} else {
+				pixman_transform_t t;
+				pixman_transform_init_scale(&t, pixman_double_to_fixed(1.0 / sc),
+				    pixman_double_to_fixed(1.0 / sc));
+				pixman_image_set_transform(raw, &t);
+				pixman_image_set_filter(raw, PIXMAN_FILTER_BILINEAR, NULL, 0);
+				pixman_image_composite32(PIXMAN_OP_SRC, raw, NULL, dst,
+				    0, 0, 0, 0, 0, 0, dw, dh);
+				pixman_image_unref(raw);
+				free(data);
+				s->img = dst;
+				s->data = ddata;
+				s->w = dw;
+				s->h = dh;
+				s->left = (int)lround(s->left * sc);
+				s->top = (int)lround(s->top * sc);
+			}
 		} else {
 			s->img = raw;
 			s->data = data;
@@ -441,6 +485,10 @@ getglyph(Face *f, FT_UInt gi)
 	} else if (bm->pixel_mode == FT_PIXEL_MODE_GRAY) {
 		stride = (s->w + 3) & ~3;
 		data = malloc((size_t)stride * s->h);
+		if (!data) {
+			f->glyphs[gi] = s;
+			return s;
+		}
 		for (y = 0; y < s->h; y++)
 			memcpy(data + (size_t)y * stride,
 			    bm->buffer + (size_t)y * bm->pitch, s->w);
@@ -450,6 +498,10 @@ getglyph(Face *f, FT_UInt gi)
 	} else if (bm->pixel_mode == FT_PIXEL_MODE_MONO) {
 		stride = (s->w + 3) & ~3;
 		data = calloc((size_t)stride, s->h);
+		if (!data) {
+			f->glyphs[gi] = s;
+			return s;
+		}
 		for (y = 0; y < s->h; y++) {
 			unsigned char *row = bm->buffer + (size_t)y * bm->pitch;
 			for (int x = 0; x < s->w; x++)
@@ -533,30 +585,35 @@ in_link(int x, int y)
 	return 1;
 }
 
-/* Zwei-Pass-Rendering: fg_pass==0 zeichnet nur den Hintergrund, fg_pass==1 nur
- * Glyph + Dekorationen. Grund: überbreite Glyphen (Nerd-Font-Icons, Emoji) ragen
- * über ihre Zelle hinaus. Würde wie früher pro Zelle erst bg, dann glyph gezeichnet,
- * löschte der Hintergrund der nächsten Zelle den Überstand wieder weg ("rechts
- * abgeschnitten"). Indem rdraw() erst ALLE Hintergründe und dann ALLE Glyphen malt,
- * bleibt der Überstand erhalten und das Icon ist vollständig sichtbar. */
+/* Effektive Hintergrundfarbe einer Zelle — Bold-Aufhellung und Reverse genau
+ * wie beim Zeichnen des Vordergrunds, damit Pass 1 und Pass 2 übereinstimmen. */
+static uint32_t
+cellbg(const Glyph *gp)
+{
+	uint32_t fg = gp->fg;
+	if ((gp->mode & ATTR_BOLD) && !IS_TRUECOLOR(fg) && fg < 8)
+		fg += 8; /* bold_brightens_ansi_colors (WezTerm-Default) */
+	return (gp->mode & ATTR_REVERSE) ? fg : gp->bg;
+}
+
+/* Zwei-Pass-Rendering: rdraw füllt erst ALLE Hintergründe (Pass 1, gebatcht),
+ * dann zeichnet drawcell nur Glyph + Dekorationen (Pass 2). Grund: überbreite
+ * Glyphen (Nerd-Font-Icons, Emoji) ragen über ihre Zelle hinaus. Würde pro
+ * Zelle erst bg, dann glyph gezeichnet, löschte der Hintergrund der nächsten
+ * Zelle den Überstand wieder weg ("rechts abgeschnitten"). */
 static void
-drawcell(pixman_image_t *buf, int px, int py, const Glyph *gp, int fg_pass, int linkul)
+drawcell(pixman_image_t *buf, int px, int py, const Glyph *gp, int linkul)
 {
 	uint32_t fg = gp->fg, bg = gp->bg, t;
 	uint16_t mode = gp->mode;
-	pixman_color_t cfg, cbg;
+	pixman_color_t cfg;
 	int w = (mode & ATTR_WIDE) ? 2 : 1;
 
 	if ((mode & ATTR_BOLD) && !IS_TRUECOLOR(fg) && fg < 8)
 		fg += 8; /* bold_brightens_ansi_colors (WezTerm-Default) */
 
 	if (mode & ATTR_REVERSE) { t = fg; fg = bg; bg = t; }
-
-	if (!fg_pass) {
-		loadcolor(bg, 1, &cbg);
-		fillrect(buf, px, py, cellw * w, cellh, &cbg);
-		return;
-	}
+	(void)bg;
 
 	loadcolor(fg, 0, &cfg);
 
@@ -628,13 +685,28 @@ rdraw(pixman_image_t *buf, int border)
 	loadcolor(DEFAULTBG, 1, &dbg);
 	fillrect(buf, 0, 0, bw, bh, &dbg);
 
-	/* Pass 1: alle Hintergründe füllen */
+	/* Pass 1: Hintergründe. Zellen mit Default-BG deckt die Basisfüllung
+	 * bereits ab; zusammenhängende Läufe gleicher Farbe (Statusbars,
+	 * Selektionen) werden mit einem einzigen fillrect gefüllt. Das spart
+	 * bei typischem Inhalt >90% der pixman-Aufrufe dieses Passes. */
 	for (y = 0; y < term.row; y++) {
 		line = tgetline(y);
-		for (x = 0; x < term.col; x++) {
-			if (line[x].mode & ATTR_WDUMMY)
-				continue;
-			drawcell(buf, border + x * cellw, border + y * cellh, &line[x], 0, 0);
+		for (x = 0; x < term.col; ) {
+			uint32_t bg;
+			int x2;
+			if (line[x].mode & ATTR_WDUMMY) { x++; continue; }
+			bg = cellbg(&line[x]);
+			/* WDUMMY gehört zur WIDE-Zelle davor und läuft im Run mit */
+			for (x2 = x + 1; x2 < term.col &&
+			    ((line[x2].mode & ATTR_WDUMMY) || cellbg(&line[x2]) == bg); x2++)
+				;
+			if (bg != (uint32_t)DEFAULTBG) {
+				pixman_color_t cbg;
+				loadcolor(bg, 1, &cbg);
+				fillrect(buf, border + x * cellw, border + y * cellh,
+				    (x2 - x) * cellw, cellh, &cbg);
+			}
+			x = x2;
 		}
 	}
 	/* Pass 2: alle Glyphen/Dekorationen über die fertigen Hintergründe — so kann
@@ -645,7 +717,7 @@ rdraw(pixman_image_t *buf, int border)
 		for (x = 0; x < term.col; x++) {
 			if (line[x].mode & ATTR_WDUMMY)
 				continue;
-			drawcell(buf, border + x * cellw, border + y * cellh, &line[x], 1,
+			drawcell(buf, border + x * cellw, border + y * cellh, &line[x],
 			    in_link(x, y));
 		}
 		term.dirty[y] = 0;

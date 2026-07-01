@@ -9,6 +9,7 @@
 #ifdef __GLIBC__
 #include <malloc.h>
 #endif
+#include <poll.h>
 #include <pwd.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -315,8 +316,6 @@ uopen(const char *url)
 		url = buf;
 	}
 
-	fprintf(stderr, "[tintty DEBUG] uopen: %s \"%s\"\n", browser_cmd, url);
-
 	/* Doppel-fork: der Enkel wird von init adoptiert -> kein Zombie und
 	 * unabhängig vom SIGCHLD-Handler, der nur die Shell-pid reapt. */
 	if ((p = fork()) < 0)
@@ -327,8 +326,6 @@ uopen(const char *url)
 			signal(SIGCHLD, SIG_DFL);
 			signal(SIGHUP, SIG_DFL);
 			execlp(browser_cmd, browser_cmd, url, (char *)NULL);
-			fprintf(stderr, "[tintty DEBUG] execlp(%s) fehlgeschlagen: %s\n",
-			    browser_cmd, strerror(errno));
 			_exit(127);
 		}
 		_exit(0);
@@ -340,17 +337,46 @@ void
 ttywrite(const char *s, size_t n, int may_echo)
 {
 	(void)may_echo;
+	struct pollfd pfd;
+	size_t lim = 256;
 	ssize_t r;
 
+	/* Beim Schreiben gleichzeitig das PTY leeren (st-Ansatz): blockiert nur
+	 * write(), entsteht ein Deadlock, sobald der PTY-Eingabepuffer voll ist
+	 * und das Programm seinerseits auf uns wartet, um Ausgabe loszuwerden
+	 * (z.B. großer Paste in ein Programm, das dabei Output produziert). */
 	while (n > 0) {
-		r = write(cmdfd, s, n);
-		if (r < 0) {
-			if (errno == EAGAIN || errno == EINTR)
+		pfd.fd = cmdfd;
+		pfd.events = POLLIN | POLLOUT;
+		pfd.revents = 0;
+		if (poll(&pfd, 1, -1) < 0) {
+			if (errno == EINTR)
 				continue;
 			return;
 		}
-		n -= r;
-		s += r;
+		if (pfd.revents & POLLOUT) {
+			if ((r = write(cmdfd, s, MIN(n, lim))) < 0) {
+				if (errno == EAGAIN || errno == EINTR)
+					continue;
+				return; /* z.B. EPIPE nach Shell-Ende */
+			}
+			if ((size_t)r >= n)
+				return;
+			/* Puffer läuft voll — Gegenseite lesen, um Platz zu schaffen */
+			if (n < lim)
+				if ((lim = ttyread()) == 0)
+					lim = 256;
+			n -= r;
+			s += r;
+		}
+		if (pfd.revents & POLLIN)
+			if ((lim = ttyread()) == 0)
+				lim = 256;
+		if (pfd.revents & (POLLERR | POLLNVAL))
+			return;
+		/* nur HUP, nichts les-/schreibbar: PTY tot, sonst Busy-Loop */
+		if ((pfd.revents & POLLHUP) && !(pfd.revents & (POLLIN | POLLOUT)))
+			return;
 	}
 }
 
@@ -368,6 +394,8 @@ ttyread(void)
 	case -1:
 		if (errno == EAGAIN || errno == EINTR)
 			return 0;
+		if (errno == EIO)
+			exit(0); /* Slave-Seite zu (Shell beendet) — normales Ende */
 		die("read error on tty: %s\n", strerror(errno));
 	default:
 		buflen += ret;
@@ -846,6 +874,27 @@ treset(void)
 	}
 }
 
+#if HISTSIZE > 0
+/* Scrollback komplett verwerfen und den Speicher ans OS zurückgeben —
+ * ein voller Verlauf hält sonst dauerhaft HISTSIZE*col*sizeof(Glyph)
+ * (bei 5000x120 knapp 10 MB), obwohl er nie wieder gelesen wird. */
+static void
+thistfree(void)
+{
+	int i;
+	for (i = 0; i < HISTSIZE; i++) {
+		free(term.hist[i]);
+		term.hist[i] = NULL;
+	}
+	term.histi = 0;
+	term.histn = 0;
+	term.scr = 0;
+#ifdef __GLIBC__
+	malloc_trim(0);
+#endif
+}
+#endif
+
 /* Hard Reset (Ctrl+Shift+R): vollständiger Zustand + Scrollback verwerfen.
  * Rettet das Terminal nach kaputten Escape-Sequenzen. */
 void
@@ -853,9 +902,7 @@ tresetfull(void)
 {
 	treset();
 #if HISTSIZE > 0
-	term.histi = 0;
-	term.histn = 0;
-	term.scr = 0;
+	thistfree();
 #endif
 	tfulldirt();
 }
@@ -866,9 +913,7 @@ void
 tclearall(void)
 {
 #if HISTSIZE > 0
-	term.histi = 0;
-	term.histn = 0;
-	term.scr = 0;
+	thistfree();
 #endif
 	tclearregion(0, 0, term.col - 1, term.row - 1);
 	tmoveto(0, 0);
@@ -911,8 +956,19 @@ tresize(int col, int row)
 	if (col < 1 || row < 1)
 		return;
 
-	/* überschüssige Zeilen freigeben */
-	for (i = row; i < term.row; i++) {
+	/* Beim Höhen-Schrumpfen den Inhalt nach oben schieben, damit die
+	 * Cursorzeile (Prompt) sichtbar bleibt — es fallen die obersten
+	 * Zeilen weg, nicht die untersten (wie st). */
+	for (i = 0; i <= term.c.y - row; i++) {
+		free(term.line[i]);
+		free(term.alt[i]);
+	}
+	if (i > 0) {
+		memmove(term.line, term.line + i, row * sizeof(Line));
+		memmove(term.alt, term.alt + i, row * sizeof(Line));
+	}
+	/* restliche überschüssige Zeilen (unterhalb des verschobenen Fensters) */
+	for (i += row; i < term.row; i++) {
 		free(term.line[i]);
 		free(term.alt[i]);
 	}
@@ -1249,8 +1305,14 @@ csihandle(void)
 			tclearregion(0, term.c.y, term.c.x, term.c.y);
 			break;
 		case 2: /* all */
-		case 3:
 			tclearregion(0, 0, term.col - 1, term.row - 1);
+			break;
+		case 3: /* xterm: Erase Saved Lines (Scrollback) — "clear"
+		         * sendet 2J+3J; gibt zugleich den Verlauf-Speicher frei */
+#if HISTSIZE > 0
+			thistfree();
+			tfulldirt();
+#endif
 			break;
 		default:
 			goto unknown;
@@ -1297,6 +1359,14 @@ csihandle(void)
 		DEFAULT(csiescseq.arg[0], 1);
 		tdeletechar(csiescseq.arg[0]);
 		break;
+	case 'b': /* REP -- letztes druckbares Zeichen n-mal wiederholen.
+	           * xterm-256color-terminfo advertised "rep", ncurses nutzt es —
+	           * ohne Implementierung fehlen wiederholte Zeichen im Bild. */
+		DEFAULT(csiescseq.arg[0], 1);
+		if (term.lastc)
+			for (n = csiescseq.arg[0]; n > 0; n--)
+				tputc(term.lastc);
+		break;
 	case 'Z': /* CBT -- cursor backward tabulation */
 		DEFAULT(csiescseq.arg[0], 1);
 		for (n = csiescseq.arg[0]; n > 0 && term.c.x > 0; n--) {
@@ -1327,6 +1397,8 @@ csihandle(void)
 		}
 		break;
 	case 'r': /* DECSTBM -- set scrolling region */
+		if (csiescseq.priv)
+			goto unknown; /* CSI ? Pm r = Restore DEC Private Mode */
 		DEFAULT(csiescseq.arg[0], 1);
 		DEFAULT(csiescseq.arg[1], term.row);
 		tsetscroll(csiescseq.arg[0] - 1, csiescseq.arg[1] - 1);
@@ -1366,6 +1438,10 @@ tsetmode(int priv, int set, const int *args, int narg)
 				if (set) term.mode |= MODE_APPCURSOR;
 				else term.mode &= ~MODE_APPCURSOR;
 				break;
+			case 6: /* DECOM -- origin mode */
+				MODBIT(term.c.state, set, CURSOR_ORIGIN);
+				tmoveato(0, 0);
+				break;
 			case 7: /* DECAWM -- auto wrap */
 				if (set) term.mode |= MODE_WRAP;
 				else term.mode &= ~MODE_WRAP;
@@ -1394,7 +1470,7 @@ tsetmode(int priv, int set, const int *args, int narg)
 			case 1004: /* focus events */
 			case 12:   /* cursor blink */
 				break;
-			case 1049: /* swap screen & save/restore cursor */
+			case 1049: /* swap screen & save/restore cursor (xterm) */
 				if (!allowaltscreen)
 					break;
 				tcursor(set ? CURSOR_SAVE : CURSOR_LOAD);
@@ -1408,7 +1484,12 @@ tsetmode(int priv, int set, const int *args, int narg)
 					tclearregion(0, 0, term.col - 1, term.row - 1);
 				if (set ^ alt)
 					tswapscreen();
-				break;
+				/* 1049 sichert/lädt den Cursor auf BEIDEN Screens —
+				 * sonst landet der Cursor nach dem Verlassen des
+				 * Alt-Screens (vim/less) nicht an der Prompt-Position. */
+				if (*args != 1049)
+					break;
+				/* FALLTHROUGH */
 			case 1048:
 				if (!allowaltscreen)
 					break;
@@ -1482,8 +1563,14 @@ strhandle(void)
 		case 0:
 		case 1:
 		case 2:
-			if (strescseq.narg > 1)
+			if (strescseq.narg > 1) {
+				int k;
+				/* strparse hat an jedem ';' getrennt — für den Titel
+				 * die Trenner wiederherstellen ("vim: a;b" bleibt ganz) */
+				for (k = 2; k < strescseq.narg; k++)
+					strescseq.args[k][-1] = ';';
 				xsettitle(strescseq.args[1]);
+			}
 			return;
 		default:
 			/* 4 (Palette), 52 (Clipboard), 10/11/12 ... -> post-v1 */
@@ -1744,7 +1831,13 @@ check_control:
 		memmove(gp + width, gp, (term.col - term.c.x - width) * sizeof(Glyph));
 
 	if (term.c.x + width > term.col) {
-		tnewline(1);
+		if (IS_SET(MODE_WRAP)) {
+			tnewline(1);
+		} else {
+			/* Wrap aus: Wide-Char am Rand überschreibt die letzten
+			 * Zellen, statt eine ungewollte neue Zeile zu erzeugen */
+			tmoveto(term.col - width, term.c.y);
+		}
 		gp = &term.line[term.c.y][term.c.x];
 	}
 
@@ -1754,7 +1847,7 @@ check_control:
 	if (width == 2) {
 		gp->mode |= ATTR_WIDE;
 		if (term.c.x + 1 < term.col) {
-			if (gp[1].mode == ATTR_WIDE && term.c.x + 2 < term.col) {
+			if ((gp[1].mode & ATTR_WIDE) && term.c.x + 2 < term.col) {
 				gp[2].u = ' ';
 				gp[2].mode &= ~ATTR_WDUMMY;
 			}

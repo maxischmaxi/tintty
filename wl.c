@@ -136,20 +136,6 @@ die(const char *fmt, ...)
 	exit(1);
 }
 
-/* TEMP: Link-Klick-Diagnose nach /tmp/tintty-link.log */
-static void
-linkdbg(const char *fmt, ...)
-{
-	FILE *f = fopen("/tmp/tintty-link.log", "a");
-	va_list ap;
-	if (!f)
-		return;
-	va_start(ap, fmt);
-	vfprintf(f, fmt, ap);
-	va_end(ap);
-	fclose(f);
-}
-
 /* ------------------------------------------------------------------ Puffer */
 static int
 alloc_shm(size_t size)
@@ -264,11 +250,14 @@ configure_size(int lw, int lh)
 		return;
 	}
 
+	/* Puffer nur neu anlegen, wenn sich die Pixelgröße ändert — beim Zoom
+	 * (gleiches Fenster, anderes Grid) bleiben die shm-Puffer erhalten. */
+	if (pw != g.bufw || ph != g.bufh)
+		create_buffers(pw, ph);
 	g.bufw = pw;
 	g.bufh = ph;
 	g.logw = lw;
 	g.logh = lh;
-	create_buffers(pw, ph);
 	tresize(cols, rows);
 	ttyresize(pw - 2 * bpx, ph - 2 * bpx);
 	if (g.have_frac && g.viewport)
@@ -492,14 +481,35 @@ clip_recv(void *offer, const char *mime, size_t *outlen,
 	return buf;
 }
 
+/* Zeilenenden für die Terminal-Eingabe normalisieren: \r\n und \n -> \r
+ * (Enter ist \r; nackte \n verwirren readline/vim). In-place, gibt die
+ * neue Länge zurück. */
+static size_t
+paste_normalize(char *b, size_t len)
+{
+	size_t r, w = 0;
+
+	for (r = 0; r < len; r++) {
+		if (b[r] == '\n') {
+			if (r > 0 && b[r - 1] == '\r')
+				continue; /* \r\n: \r wurde schon ausgegeben */
+			b[w++] = '\r';
+		} else {
+			b[w++] = b[r];
+		}
+	}
+	return w;
+}
+
 /* Puffer ans PTY. Im Bracketed-Paste-Modus wrappen und einen eingebetteten
  * Terminator \e[201~ herausfiltern (sonst könnte Inhalt aus dem Paste
  * ausbrechen). */
 static void
-clip_send(const char *buf, size_t len)
+clip_send(char *buf, size_t len)
 {
 	if (!buf || len == 0)
 		return;
+	len = paste_normalize(buf, len);
 	if (term.mode & MODE_BRCKTPASTE) {
 		size_t i, start = 0;
 		ttywrite("\033[200~", 6, 0);
@@ -532,6 +542,7 @@ clip_paste_clipboard(void)
 	buf = clip_recv(g.sel_offer, st->mime, &len, do_recv_clip);
 	clip_send(buf, len);
 	free(buf);
+	g.need_redraw = 1; /* ttywrite kann Echo bereits konsumiert haben */
 }
 
 static void
@@ -549,6 +560,7 @@ clip_paste_primary(void)
 	buf = clip_recv(g.psel_offer, st->mime, &len, do_recv_prim);
 	clip_send(buf, len);
 	free(buf);
+	g.need_redraw = 1; /* ttywrite kann Echo bereits konsumiert haben */
 }
 
 /* ------------------------------------------------------------------ Tastatur */
@@ -593,15 +605,28 @@ specialkey(xkb_keysym_t sym, int mods, char *out)
 	(mods ? sprintf(out, "\033[1;%d%c", m, fin) : sprintf(out, "\033O%c", fin))
 
 	switch (sym) {
+	/* KP_*: Ziffernblock ohne NumLock (mit NumLock liefern die Tasten
+	 * Ziffern-Syms und laufen über den utf8-Pfad). */
+	case XKB_KEY_KP_Up:
 	case XKB_KEY_Up:        return ARROW('A');
+	case XKB_KEY_KP_Down:
 	case XKB_KEY_Down:      return ARROW('B');
+	case XKB_KEY_KP_Right:
 	case XKB_KEY_Right:     return ARROW('C');
+	case XKB_KEY_KP_Left:
 	case XKB_KEY_Left:      return ARROW('D');
+	case XKB_KEY_KP_Home:
 	case XKB_KEY_Home:      return ARROW('H');
+	case XKB_KEY_KP_End:
 	case XKB_KEY_End:       return ARROW('F');
+	case XKB_KEY_KP_Begin:  return ARROW('E');
+	case XKB_KEY_KP_Insert:
 	case XKB_KEY_Insert:    return TILDE(2);
+	case XKB_KEY_KP_Delete:
 	case XKB_KEY_Delete:    return TILDE(3);
+	case XKB_KEY_KP_Prior:
 	case XKB_KEY_Prior:     return TILDE(5);
+	case XKB_KEY_KP_Next:
 	case XKB_KEY_Next:      return TILDE(6);
 	case XKB_KEY_F1:        return FN14('P');
 	case XKB_KEY_F2:        return FN14('Q');
@@ -615,13 +640,17 @@ specialkey(xkb_keysym_t sym, int mods, char *out)
 	case XKB_KEY_F10:       return TILDE(21);
 	case XKB_KEY_F11:       return TILDE(23);
 	case XKB_KEY_F12:       return TILDE(24);
-	case XKB_KEY_BackSpace: out[0] = 0x7f; return 1;
+	case XKB_KEY_BackSpace:
+		if (mods & 2) { out[0] = 033; out[1] = 0x7f; return 2; } /* Alt: ESC DEL (readline backward-kill-word) */
+		out[0] = 0x7f; return 1;
 	case XKB_KEY_Tab:
 		if (mods & 1) { return sprintf(out, "\033[Z"); } /* Shift+Tab */
 		out[0] = '\t'; return 1;
 	case XKB_KEY_ISO_Left_Tab: return sprintf(out, "\033[Z");
 	case XKB_KEY_Return:
-	case XKB_KEY_KP_Enter:  out[0] = '\r'; return 1;
+	case XKB_KEY_KP_Enter:
+		if (mods & 2) { out[0] = 033; out[1] = '\r'; return 2; } /* Alt+Return */
+		out[0] = '\r'; return 1;
 	case XKB_KEY_Escape:    out[0] = 033; return 1;
 	}
 	return 0;
@@ -1025,12 +1054,6 @@ ptr_report_button(int btn, int pressed)
 		return;
 	}
 
-	if (btn == BTN_LEFT)
-		linkdbg("btnL pressed=%d mode_mouse=%d shift=%d link_active=%d "
-		    "press_link=%d hl_url=\"%s\" press_url=\"%s\"\n",
-		    pressed, !!(term.mode & MODE_MOUSE), modon(XKB_MOD_NAME_SHIFT),
-		    link_active, press_link, hl_url, press_url);
-
 	/* Linksklick auf einen gehoverten Link öffnet ihn beim Loslassen, wenn
 	 * Press und Release über demselben Link lagen. Im App-Maus-Modus nur mit
 	 * Shift (sonst geht der Klick wie gewohnt an die Anwendung). */
@@ -1041,12 +1064,8 @@ ptr_report_button(int btn, int pressed)
 			if (link_active)
 				snprintf(press_url, sizeof press_url, "%s", hl_url);
 		} else {
-			if (press_link && link_active && !strcmp(press_url, hl_url)) {
-				linkdbg("  -> uopen(\"%s\")\n", hl_url);
+			if (press_link && link_active && !strcmp(press_url, hl_url))
 				uopen(hl_url);
-			} else {
-				linkdbg("  -> KEIN uopen (Bedingung false)\n");
-			}
 			press_link = 0;
 		}
 	}
@@ -1384,7 +1403,8 @@ run(void)
 			wl_display_read_events(g.dpy);
 		else
 			wl_display_cancel_read(g.dpy);
-		wl_display_dispatch_pending(g.dpy);
+		if (wl_display_dispatch_pending(g.dpy) < 0)
+			die("tintty: Wayland-Verbindung verloren"); /* sonst Busy-Spin auf totem fd */
 
 		if (g.closed)
 			break;
@@ -1397,7 +1417,10 @@ run(void)
 		 * zeichnen (sonst läge die Latenz konstant bei maxlatency). */
 		int sawevent = (pfds[0].revents & POLLIN) || (pfds[1].revents & POLLIN);
 
-		if (pfds[1].revents & POLLIN) {
+		/* POLLHUP ohne POLLIN (Slave zu, nichts mehr zu lesen): ttyread
+		 * beendet sauber via read()==0/EIO — sonst poll-Busy-Spin, bis
+		 * das SIGCHLD eintrifft. */
+		if (pfds[1].revents & (POLLIN | POLLHUP)) {
 			ttyread();
 			g.need_redraw = 1;
 		}
